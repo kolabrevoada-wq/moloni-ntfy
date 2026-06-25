@@ -389,7 +389,8 @@ def doc_reference(doc: dict) -> str:
 
 
 def notify_sale(cfg: Config, doc: dict, salesman: str | None, daily_total: float) -> None:
-    total = fmt_eur(doc.get("gross_value"))
+    # Moloni: net_value = total COM IVA; gross_value = base sem IVA.
+    total = fmt_eur(doc.get("net_value"))
     vendedor = (salesman or "").strip() or "—"
     message = (
         f"Total: {total}\n"
@@ -422,11 +423,11 @@ def matches_filters(cfg: Config, doc: dict) -> bool:
 
 
 def daily_total_for(docs: list, doc: dict) -> float:
-    """Sum of gross_value for same-day sales up to and including this document."""
+    """Sum of net_value (com IVA) for same-day sales up to and including this doc."""
     day = str(doc.get("date", ""))[:10]
     did = int(doc.get("document_id", 0))
     return sum(
-        float(d.get("gross_value") or 0)
+        float(d.get("net_value") or 0)
         for d in docs
         if str(d.get("date", ""))[:10] == day and int(d.get("document_id", 0)) <= did
     )
@@ -596,7 +597,7 @@ def cmd_list_types(cfg: Config) -> None:
             f"  doc_id={d.get('document_id')}  tipo={d.get('document_type_id')}  "
             f"serie={(d.get('document_set') or {}).get('name')}  "
             f"status={d.get('status')}  {d.get('date')}  "
-            f"{d.get('entity_name')}  {fmt_eur(d.get('gross_value'))}"
+            f"{d.get('entity_name')}  {fmt_eur(d.get('net_value'))}"
         )
     print(
         "\nDica: define MOLONI_DOCUMENT_TYPE_ID e/ou MOLONI_DOCUMENT_SET_ID e "
