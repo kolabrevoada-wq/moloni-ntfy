@@ -24,7 +24,7 @@ import os
 import signal
 import sys
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import requests
 
@@ -103,6 +103,11 @@ class Config:
         self.poll_interval = int(os.getenv("POLL_INTERVAL_SECONDS", "120"))
         self.state_file = os.getenv("STATE_FILE", "./data/state.json")
         self.log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+
+        # Active window (local business hours); empty = always active.
+        self.active_start = os.getenv("ACTIVE_START", "").strip()  # "HH:MM"
+        self.active_end = os.getenv("ACTIVE_END", "").strip()      # "HH:MM"
+        self.active_tz = os.getenv("ACTIVE_TZ", "Europe/Lisbon").strip()
 
     def require_moloni(self) -> None:
         missing = [
@@ -427,7 +432,39 @@ def daily_total_for(docs: list, doc: dict) -> float:
     )
 
 
+def _hhmm_to_minutes(value: str) -> int:
+    hours, _, minutes = value.partition(":")
+    return int(hours) * 60 + int(minutes or 0)
+
+
+def within_active_window(cfg: Config, now: "datetime | None" = None) -> bool:
+    """True if 'now' (in cfg.active_tz) is inside [active_start, active_end]."""
+    if not cfg.active_start or not cfg.active_end:
+        return True
+    if now is None:
+        try:
+            from zoneinfo import ZoneInfo
+
+            now = datetime.now(ZoneInfo(cfg.active_tz))
+        except Exception:
+            now = datetime.now()  # fallback: server local time
+    now_min = now.hour * 60 + now.minute
+    start = _hhmm_to_minutes(cfg.active_start)
+    end = _hhmm_to_minutes(cfg.active_end)
+    if start <= end:
+        return start <= now_min <= end
+    return now_min >= start or now_min <= end  # overnight window
+
+
 def poll_once(cfg: Config, state: State) -> int:
+    if not within_active_window(cfg):
+        LOG.info(
+            "Fora do horário ativo (%s-%s %s); ciclo ignorado.",
+            cfg.active_start,
+            cfg.active_end,
+            cfg.active_tz,
+        )
+        return 0
     moloni = Moloni(cfg, state)
 
     def work():

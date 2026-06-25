@@ -153,6 +153,8 @@ journalctl -u moloni-ntfy -f
 | `NTFY_PRIORITY` | `high` | min / low / default / high / urgent |
 | `POLL_INTERVAL_SECONDS` | `120` | Frequência do polling |
 | `STATE_FILE` | `./data/state.json` | Onde guarda o estado |
+| `ACTIVE_START` / `ACTIVE_END` | (vazio) | Janela ativa local `"HH:MM"` (vazio = 24h) |
+| `ACTIVE_TZ` | `Europe/Lisbon` | Fuso horário da janela ativa (trata do verão/inverno) |
 
 ## Resolução de problemas
 
