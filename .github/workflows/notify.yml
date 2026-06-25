@@ -25,6 +25,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Marcar início do job
+        run: date +%s > "$RUNNER_TEMP/job_start"
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -67,7 +70,7 @@ jobs:
           path: data
           key: moloni-state-${{ github.run_id }}
 
-      - name: Relançar a corrente
+      - name: Relançar a corrente (24/7)
         if: always()
         env:
           GH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
@@ -77,9 +80,12 @@ jobs:
             echo "Sem DISPATCH_TOKEN: a corrente nao se relanca; fica so o schedule."
             exit 0
           fi
-          HHMM=$(TZ=Europe/Lisbon date +%H%M)
-          if (( 10#$HHMM >= 900 && 10#$HHMM < 2030 )); then
-            gh workflow run notify.yml --ref main && echo "Corrente relancada ($HHMM Lisboa)."
-          else
-            echo "Fora do horario ($HHMM Lisboa); a corrente reinicia de manha pelo schedule."
+          START=$(cat "$RUNNER_TEMP/job_start" 2>/dev/null || echo 0)
+          ELAPSED=$(( $(date +%s) - START ))
+          # Anti-runaway: so relanca se correu o tempo normal (>=300s). Falhas
+          # rapidas (ex.: infra) nao relancam -> recuperacao fica para o schedule.
+          if [ "$START" -eq 0 ] || [ "$ELAPSED" -lt 300 ]; then
+            echo "Job durou ${ELAPSED}s (<300s); nao relanco (o schedule recupera)."
+            exit 0
           fi
+          gh workflow run notify.yml --ref main && echo "Corrente relancada (apos ${ELAPSED}s)."

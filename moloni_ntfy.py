@@ -465,19 +465,6 @@ def within_active_window(cfg: Config, now: "datetime | None" = None) -> bool:
     return now_min >= start or now_min <= end  # overnight window
 
 
-def past_active_window(cfg: Config, now: "datetime | None" = None) -> bool:
-    """True if today's active window has already ended (so the daemon may exit)."""
-    if not cfg.active_start or not cfg.active_end:
-        return False
-    start = _hhmm_to_minutes(cfg.active_start)
-    end = _hhmm_to_minutes(cfg.active_end)
-    if start > end:  # overnight window: never auto-exit
-        return False
-    if now is None:
-        now = _local_now(cfg)
-    return (now.hour * 60 + now.minute) > end
-
-
 def poll_once(cfg: Config, state: State) -> int:
     if not within_active_window(cfg):
         LOG.info(
@@ -565,9 +552,6 @@ def run_forever(cfg: Config) -> None:
             poll_once(cfg, state)
         except Exception as exc:  # keep the daemon alive on transient errors
             LOG.exception("Erro no ciclo de polling: %s", exc)
-        if past_active_window(cfg):
-            LOG.info("Horario terminado; a sair (o schedule reinicia amanha).")
-            break
         for _ in range(cfg.poll_interval):  # responsive sleep for fast shutdown
             if _STOP or time_up():
                 break
