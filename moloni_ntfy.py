@@ -109,6 +109,10 @@ class Config:
         self.active_end = os.getenv("ACTIVE_END", "").strip()      # "HH:MM"
         self.active_tz = os.getenv("ACTIVE_TZ", "Europe/Lisbon").strip()
 
+        # Max seconds for `run` before exiting (0 = unlimited). Used in CI so the
+        # job ends in time to be relaunched (the GitHub Actions "chain").
+        self.max_runtime = int(os.getenv("MAX_RUNTIME_SECONDS", "0"))
+
     def require_moloni(self) -> None:
         missing = [
             name
@@ -433,6 +437,15 @@ def daily_total_for(docs: list, doc: dict) -> float:
     )
 
 
+def _local_now(cfg: Config) -> "datetime":
+    try:
+        from zoneinfo import ZoneInfo
+
+        return datetime.now(ZoneInfo(cfg.active_tz))
+    except Exception:
+        return datetime.now()  # fallback: server local time
+
+
 def _hhmm_to_minutes(value: str) -> int:
     hours, _, minutes = value.partition(":")
     return int(hours) * 60 + int(minutes or 0)
@@ -443,18 +456,26 @@ def within_active_window(cfg: Config, now: "datetime | None" = None) -> bool:
     if not cfg.active_start or not cfg.active_end:
         return True
     if now is None:
-        try:
-            from zoneinfo import ZoneInfo
-
-            now = datetime.now(ZoneInfo(cfg.active_tz))
-        except Exception:
-            now = datetime.now()  # fallback: server local time
+        now = _local_now(cfg)
     now_min = now.hour * 60 + now.minute
     start = _hhmm_to_minutes(cfg.active_start)
     end = _hhmm_to_minutes(cfg.active_end)
     if start <= end:
         return start <= now_min <= end
     return now_min >= start or now_min <= end  # overnight window
+
+
+def past_active_window(cfg: Config, now: "datetime | None" = None) -> bool:
+    """True if today's active window has already ended (so the daemon may exit)."""
+    if not cfg.active_start or not cfg.active_end:
+        return False
+    start = _hhmm_to_minutes(cfg.active_start)
+    end = _hhmm_to_minutes(cfg.active_end)
+    if start > end:  # overnight window: never auto-exit
+        return False
+    if now is None:
+        now = _local_now(cfg)
+    return (now.hour * 60 + now.minute) > end
 
 
 def poll_once(cfg: Config, state: State) -> int:
@@ -527,21 +548,32 @@ def run_forever(cfg: Config) -> None:
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
     LOG.info(
-        "Monitorizacao iniciada (intervalo=%ss, ntfy=%s, topico=%s).",
+        "Monitorizacao iniciada (intervalo=%ss, ntfy=%s, topico=%s, max_runtime=%ss).",
         cfg.poll_interval,
         cfg.ntfy_server,
         cfg.ntfy_topic,
+        cfg.max_runtime or "ilimitado",
     )
     state = State.load(cfg.state_file)
-    while not _STOP:
+    started = time.time()
+
+    def time_up() -> bool:
+        return bool(cfg.max_runtime) and (time.time() - started) >= cfg.max_runtime
+
+    while not _STOP and not time_up():
         try:
             poll_once(cfg, state)
         except Exception as exc:  # keep the daemon alive on transient errors
             LOG.exception("Erro no ciclo de polling: %s", exc)
+        if past_active_window(cfg):
+            LOG.info("Horario terminado; a sair (o schedule reinicia amanha).")
+            break
         for _ in range(cfg.poll_interval):  # responsive sleep for fast shutdown
-            if _STOP:
+            if _STOP or time_up():
                 break
             time.sleep(1)
+    if time_up():
+        LOG.info("MAX_RUNTIME_SECONDS atingido; a sair para relancar a corrente.")
     LOG.info("Monitorizacao terminada.")
 
 

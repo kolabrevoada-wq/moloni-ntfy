@@ -73,29 +73,35 @@ python moloni_ntfy.py check         # valida login no Moloni + empresa + filtros
 
 ### Opção A — GitHub Actions (recomendada, grátis)
 
-Já incluído em `.github/workflows/notify.yml`: corre `moloni_ntfy.py once` a cada
-5 minutos e guarda o estado (último documento visto + tokens) entre execuções
-através do cache do Actions.
+Já incluído em `.github/workflows/notify.yml`. O agendador do GitHub descarta
+execuções frequentes, por isso **não** dependemos dele: cada arranque lança um
+**poller contínuo** (`moloni_ntfy.py run`) que verifica de 2 em 2 min durante
+~5,5h e **relança o seguinte sozinho** (corrente via `workflow_dispatch`). O
+`schedule` é só rede de segurança / ignição da manhã. O estado persiste no cache.
 
-1. Cria um repositório no GitHub e envia este projeto:
+1. Cria um repositório **público** (Actions grátis e ilimitado) e envia o projeto:
    ```bash
    git init && git add . && git commit -m "Moloni -> ntfy"
-   gh repo create moloni-ntfy --private --source=. --push
+   gh repo create moloni-ntfy --public --source=. --push
    ```
 2. Configura os secrets a partir do teu `.env`:
    ```bash
    gh auth login          # se ainda não estiveres autenticado
    ./setup-github-secrets.sh
    ```
-3. Na aba **Actions**, ativa os workflows e corre uma vez à mão (**Run workflow**)
-   para criar a linha de base. A partir daí corre sozinho a cada ~5 min.
+3. Configura o token que deixa a corrente relançar-se (precisa do scope `workflow`):
+   ```bash
+   gh auth token | gh secret set DISPATCH_TOKEN
+   # melhor ainda: um PAT fine-grained com Actions: read/write só deste repo
+   ```
+4. Na aba **Actions**, ativa os workflows e corre **Run workflow** para arrancar
+   a corrente.
 
 Notas:
-- O GitHub pode atrasar execuções agendadas alguns minutos sob carga.
-- Workflows agendados são **desativados após 60 dias sem commits** no repositório.
-- Se já tens os secrets `MOLONI_*` no teu repo *Moloni-Shopify-Sync*, podes em
-  alternativa copiar só `notify.yml` + `moloni_ntfy.py` para esse repo e adicionar
-  apenas o secret `NTFY_TOPIC`.
+- O GitHub Actions não foi feito para ser servidor sempre-ligado. Isto é o mais
+  fiável possível, mas se o GitHub limitar uso contínuo, passa para a Opção B (VM).
+- Sem `DISPATCH_TOKEN` a corrente não se relança e ficas só com o `schedule`
+  (pouco fiável). O horário 10:00–20:30 está fixado no workflow.
 
 ### Opção B — Docker numa VM
 

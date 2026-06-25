@@ -1,22 +1,27 @@
 name: Moloni -> ntfy
 
 on:
+  workflow_dispatch:
+    inputs:
+      max_runtime:
+        description: "Segundos a correr antes de relancar (para testes, usa um valor baixo, ex. 90)"
+        required: false
+        default: "19800"
   schedule:
-    # O GitHub corre em UTC. A janela 09:00-20:55 UTC cobre as 10:00-20:30 de
-    # Portugal tanto no verão (UTC+1) como no inverno (UTC+0); o programa filtra
-    # depois a hora exata via Europe/Lisbon (ACTIVE_START/ACTIVE_END).
-    - cron: "*/5 9-20 * * *"
-  workflow_dispatch: {}   # permite correr manualmente a partir da aba Actions
+    # Rede de seguranca: ignicao de manha + recuperacao se a corrente quebrar.
+    # O GitHub descarta muitas destas execucoes; basta UMA pegar. A cadencia real
+    # (de 2 em 2 min) vem do poller continuo + auto-relancamento, nao daqui.
+    - cron: "*/10 8-20 * * *"
 
-# Evita execuções sobrepostas (cada run termina em segundos).
+# Garante um unico poller a correr de cada vez.
 concurrency:
-  group: moloni-ntfy
+  group: moloni-poller
   cancel-in-progress: false
 
 jobs:
   poll:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
 
@@ -27,7 +32,6 @@ jobs:
       - name: Instalar dependências
         run: pip install requests python-dotenv tzdata
 
-      # Restaura o estado (last_seen_document_id + tokens) da execução anterior.
       - name: Restaurar estado
         uses: actions/cache/restore@v4
         with:
@@ -36,7 +40,7 @@ jobs:
           restore-keys: |
             moloni-state-
 
-      - name: Verificar vendas e notificar
+      - name: Poller contínuo (modo run)
         env:
           MOLONI_CLIENT_ID: ${{ secrets.MOLONI_CLIENT_ID }}
           MOLONI_CLIENT_SECRET: ${{ secrets.MOLONI_CLIENT_SECRET }}
@@ -51,12 +55,31 @@ jobs:
           ACTIVE_START: "10:00"
           ACTIVE_END: "20:30"
           ACTIVE_TZ: Europe/Lisbon
-        run: python moloni_ntfy.py once
+          POLL_INTERVAL_SECONDS: "120"
+          # ~5,5h por job (limite do GitHub é 6h); depois relança o seguinte.
+          MAX_RUNTIME_SECONDS: ${{ github.event.inputs.max_runtime || '19800' }}
+        run: python moloni_ntfy.py run
 
-      # Guarda o estado atualizado para a próxima execução.
       - name: Guardar estado
         if: always()
         uses: actions/cache/save@v4
         with:
           path: data
           key: moloni-state-${{ github.run_id }}
+
+      - name: Relançar a corrente
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "Sem DISPATCH_TOKEN: a corrente nao se relanca; fica so o schedule."
+            exit 0
+          fi
+          HHMM=$(TZ=Europe/Lisbon date +%H%M)
+          if (( 10#$HHMM >= 900 && 10#$HHMM < 2030 )); then
+            gh workflow run notify.yml --ref main && echo "Corrente relancada ($HHMM Lisboa)."
+          else
+            echo "Fora do horario ($HHMM Lisboa); a corrente reinicia de manha pelo schedule."
+          fi
