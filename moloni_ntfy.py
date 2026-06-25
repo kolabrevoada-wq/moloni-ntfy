@@ -1,0 +1,624 @@
+#!/usr/bin/env python3
+"""
+Moloni -> ntfy notifier.
+
+Polls the Moloni (classic, API v1) documents endpoint and sends a push
+notification through ntfy whenever a new in-store sale shows up.
+
+Commands:
+    run           Run forever, polling every POLL_INTERVAL_SECONDS (cloud/daemon).
+    once          Do a single poll and exit (use from cron / serverless).
+    check         Validate config + Moloni auth + company; print a summary.
+    list-types    Print document types, document sets and the latest documents,
+                  to help you pick what counts as an "in-store sale".
+    test-notify   Send a test notification through ntfy.
+
+Configuration comes from environment variables (see .env.example).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import signal
+import sys
+import time
+from datetime import date, timedelta
+
+import requests
+
+LOG = logging.getLogger("moloni-ntfy")
+
+MOLONI_BASE_URL = "https://api.moloni.pt/v1"
+GRANT_URL = f"{MOLONI_BASE_URL}/grant/"
+
+# ntfy priority names -> JSON priority numbers
+NTFY_PRIORITIES = {"min": 1, "low": 2, "default": 3, "high": 4, "urgent": 5}
+
+# Moloni OAuth error codes that mean "the token is no good, re-authenticate".
+TOKEN_ERRORS = {"invalid_token", "access_denied", "invalid_grant", "unauthorized"}
+
+
+class AuthError(Exception):
+    """Raised when Moloni rejects our token and we must re-authenticate."""
+
+
+class MoloniError(Exception):
+    """Raised for non-auth Moloni API errors."""
+
+
+# --------------------------------------------------------------------------- #
+# Configuration
+# --------------------------------------------------------------------------- #
+def _load_env_file(path: str = ".env") -> None:
+    """Load a .env file. Uses python-dotenv when available, else a tiny parser."""
+    try:
+        from dotenv import load_dotenv  # type: ignore
+
+        load_dotenv(path)
+        return
+    except Exception:
+        pass
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+def _int_or_none(value):
+    if value is None:
+        return None
+    value = str(value).strip()
+    return int(value) if value else None
+
+
+class Config:
+    def __init__(self) -> None:
+        # Moloni credentials
+        self.client_id = os.getenv("MOLONI_CLIENT_ID", "").strip()
+        self.client_secret = os.getenv("MOLONI_CLIENT_SECRET", "").strip()
+        self.username = os.getenv("MOLONI_USERNAME", "").strip()
+        self.password = os.getenv("MOLONI_PASSWORD", "").strip()
+        self.company_id = _int_or_none(os.getenv("MOLONI_COMPANY_ID"))
+
+        # What counts as an "in-store sale" (all optional; empty = no filter)
+        self.document_set_id = _int_or_none(os.getenv("MOLONI_DOCUMENT_SET_ID"))
+        self.document_type_id = _int_or_none(os.getenv("MOLONI_DOCUMENT_TYPE_ID"))
+        self.status = _int_or_none(os.getenv("MOLONI_STATUS"))
+        self.lookback_days = int(os.getenv("MOLONI_LOOKBACK_DAYS", "1"))
+
+        # ntfy
+        self.ntfy_server = os.getenv("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
+        self.ntfy_topic = os.getenv("NTFY_TOPIC", "").strip()
+        self.ntfy_token = os.getenv("NTFY_TOKEN", "").strip()
+        self.ntfy_priority = os.getenv("NTFY_PRIORITY", "default").strip().lower()
+
+        # General
+        self.poll_interval = int(os.getenv("POLL_INTERVAL_SECONDS", "120"))
+        self.state_file = os.getenv("STATE_FILE", "./data/state.json")
+        self.log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+
+    def require_moloni(self) -> None:
+        missing = [
+            name
+            for name, value in {
+                "MOLONI_CLIENT_ID": self.client_id,
+                "MOLONI_CLIENT_SECRET": self.client_secret,
+                "MOLONI_USERNAME": self.username,
+                "MOLONI_PASSWORD": self.password,
+            }.items()
+            if not value
+        ]
+        if missing:
+            raise SystemExit(
+                "Faltam variaveis obrigatorias do Moloni: " + ", ".join(missing)
+            )
+
+    def require_ntfy(self) -> None:
+        if not self.ntfy_topic:
+            raise SystemExit("Falta NTFY_TOPIC (escolhe um topico secreto e unico).")
+
+
+# --------------------------------------------------------------------------- #
+# Persistent state
+# --------------------------------------------------------------------------- #
+class State:
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.company_id = None
+        self.access_token = None
+        self.access_token_expires_at = 0.0
+        self.refresh_token = None
+        self.refresh_token_expires_at = 0.0
+        self.last_seen_document_id = 0
+
+    @classmethod
+    def load(cls, path: str) -> "State":
+        state = cls(path)
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                state.company_id = data.get("company_id")
+                state.access_token = data.get("access_token")
+                state.access_token_expires_at = data.get("access_token_expires_at", 0.0)
+                state.refresh_token = data.get("refresh_token")
+                state.refresh_token_expires_at = data.get("refresh_token_expires_at", 0.0)
+                state.last_seen_document_id = data.get("last_seen_document_id", 0)
+            except Exception as exc:
+                LOG.warning("Nao consegui ler o estado (%s): %s", path, exc)
+        return state
+
+    def save(self) -> None:
+        os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
+        tmp = f"{self.path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "company_id": self.company_id,
+                    "access_token": self.access_token,
+                    "access_token_expires_at": self.access_token_expires_at,
+                    "refresh_token": self.refresh_token,
+                    "refresh_token_expires_at": self.refresh_token_expires_at,
+                    "last_seen_document_id": self.last_seen_document_id,
+                },
+                fh,
+                indent=2,
+            )
+        os.replace(tmp, self.path)
+
+
+# --------------------------------------------------------------------------- #
+# Moloni API client
+# --------------------------------------------------------------------------- #
+class Moloni:
+    def __init__(self, cfg: Config, state: State) -> None:
+        self.cfg = cfg
+        self.state = state
+        self.session = requests.Session()
+        self._salesmen = None  # lazy cache: salesman_id -> name
+
+    # --- authentication ---------------------------------------------------- #
+    def access_token(self) -> str:
+        now = time.time()
+        if self.state.access_token and self.state.access_token_expires_at > now + 60:
+            return self.state.access_token
+        if self.state.refresh_token and self.state.refresh_token_expires_at > now + 60:
+            try:
+                return self._grant(
+                    {
+                        "grant_type": "refresh_token",
+                        "client_id": self.cfg.client_id,
+                        "client_secret": self.cfg.client_secret,
+                        "refresh_token": self.state.refresh_token,
+                    }
+                )
+            except AuthError as exc:
+                LOG.warning("Refresh falhou (%s); a autenticar com password.", exc)
+        return self._grant(
+            {
+                "grant_type": "password",
+                "client_id": self.cfg.client_id,
+                "client_secret": self.cfg.client_secret,
+                "username": self.cfg.username,
+                "password": self.cfg.password,
+            }
+        )
+
+    def reauthenticate(self) -> str:
+        self.state.access_token = None
+        self.state.refresh_token = None
+        return self.access_token()
+
+    def _grant(self, params: dict) -> str:
+        resp = self.session.get(GRANT_URL, params=params, timeout=30)
+        try:
+            data = resp.json()
+        except ValueError:
+            raise AuthError(f"Resposta invalida do grant (HTTP {resp.status_code}).")
+        if isinstance(data, dict) and data.get("error"):
+            raise AuthError(f"{data.get('error')}: {data.get('error_description', '')}")
+        token = data.get("access_token") if isinstance(data, dict) else None
+        if not token:
+            raise AuthError(f"Sem access_token na resposta: {data}")
+        now = time.time()
+        self.state.access_token = token
+        self.state.access_token_expires_at = now + int(data.get("expires_in", 3600))
+        if data.get("refresh_token"):
+            self.state.refresh_token = data["refresh_token"]
+            # Moloni refresh tokens last ~14 days.
+            self.state.refresh_token_expires_at = now + 14 * 24 * 3600
+        self.state.save()
+        LOG.info("Autenticado no Moloni.")
+        return token
+
+    # --- generic call ------------------------------------------------------ #
+    def call(self, endpoint: str, params: dict | None = None):
+        url = f"{MOLONI_BASE_URL}/{endpoint}/"
+        token = self.access_token()
+        resp = self.session.post(
+            url, params={"access_token": token}, data=params or {}, timeout=30
+        )
+        if resp.status_code in (401, 403):
+            raise AuthError(f"HTTP {resp.status_code} em {endpoint}")
+        try:
+            data = resp.json()
+        except ValueError:
+            raise MoloniError(f"Resposta nao-JSON de {endpoint} (HTTP {resp.status_code}).")
+        if isinstance(data, dict) and data.get("error"):
+            err = str(data.get("error"))
+            if err in TOKEN_ERRORS:
+                raise AuthError(f"{err} em {endpoint}")
+            raise MoloniError(f"{err}: {data.get('error_description', '')}")
+        return data
+
+    # --- helpers ----------------------------------------------------------- #
+    def company_id(self) -> int:
+        if self.cfg.company_id:
+            return self.cfg.company_id
+        if self.state.company_id:
+            return self.state.company_id
+        companies = self.call("companies/getAll")
+        if not isinstance(companies, list) or not companies:
+            raise MoloniError("companies/getAll nao devolveu empresas.")
+        for company in companies:
+            LOG.info(
+                "Empresa disponivel: id=%s nome=%s",
+                company.get("company_id"),
+                company.get("name"),
+            )
+        cid = int(companies[0]["company_id"])
+        self.state.company_id = cid
+        self.state.save()
+        LOG.info("A usar company_id=%s (define MOLONI_COMPANY_ID para fixar).", cid)
+        return cid
+
+    def recent_documents(self, company_id: int) -> list:
+        docs: list = []
+        today = date.today()
+        for delta in range(self.cfg.lookback_days + 1):
+            day = (today - timedelta(days=delta)).isoformat()
+            offset = 0
+            while True:
+                params = {
+                    "company_id": company_id,
+                    "date": day,
+                    "qty": 50,
+                    "offset": offset,
+                }
+                if self.cfg.document_set_id:
+                    params["document_set_id"] = self.cfg.document_set_id
+                if self.cfg.status is not None:
+                    params["status"] = self.cfg.status
+                page = self.call("documents/getAll", params)
+                if not isinstance(page, list) or not page:
+                    break
+                docs.extend(page)
+                if len(page) < 50:
+                    break
+                offset += 50
+        return docs
+
+    def document_types(self, company_id: int) -> list:
+        return self._paged("documents/getAllDocumentTypes", company_id)
+
+    def document_sets(self, company_id: int) -> list:
+        return self._paged("documentSets/getAll", company_id)
+
+    def _paged(self, endpoint: str, company_id: int) -> list:
+        out: list = []
+        offset = 0
+        while True:
+            page = self.call(
+                endpoint, {"company_id": company_id, "qty": 50, "offset": offset}
+            )
+            if not isinstance(page, list) or not page:
+                break
+            out.extend(page)
+            if len(page) < 50:
+                break
+            offset += 50
+        return out
+
+    def salesman_name(self, company_id: int, salesman_id) -> str | None:
+        if not salesman_id:
+            return None
+        sid = int(salesman_id)
+        if self._salesmen is None or sid not in self._salesmen:
+            self._load_salesmen(company_id)
+        return self._salesmen.get(sid)
+
+    def _load_salesmen(self, company_id: int) -> None:
+        mapping = {}
+        for s in self._paged("salesmen/getAll", company_id):
+            try:
+                mapping[int(s["salesman_id"])] = (
+                    s.get("name") or s.get("number") or ""
+                ).strip()
+            except (KeyError, TypeError, ValueError):
+                continue
+        self._salesmen = mapping
+
+
+# --------------------------------------------------------------------------- #
+# ntfy notifications
+# --------------------------------------------------------------------------- #
+def send_ntfy(cfg: Config, title: str, message: str, tags=None, priority=None) -> None:
+    payload = {
+        "topic": cfg.ntfy_topic,
+        "title": title,
+        "message": message,
+        "priority": NTFY_PRIORITIES.get(priority or cfg.ntfy_priority, 3),
+    }
+    if tags:
+        payload["tags"] = tags
+    headers = {}
+    if cfg.ntfy_token:
+        headers["Authorization"] = f"Bearer {cfg.ntfy_token}"
+    resp = requests.post(cfg.ntfy_server, json=payload, headers=headers, timeout=30)
+    if resp.status_code >= 300:
+        LOG.error("Falha a enviar ntfy (HTTP %s): %s", resp.status_code, resp.text[:200])
+    else:
+        LOG.debug("Notificacao ntfy enviada: %s", title)
+
+
+def fmt_eur(value) -> str:
+    try:
+        formatted = f"{float(value):,.2f}"  # e.g. 1,234.56
+    except (TypeError, ValueError):
+        return str(value)
+    # Convert to Portuguese formatting: 1 234,56 EUR
+    return formatted.replace(",", " ").replace(".", ",") + " €"
+
+
+def doc_reference(doc: dict) -> str:
+    set_name = (doc.get("document_set") or {}).get("name") or ""
+    ref = f"{set_name} {doc.get('number')}".strip()
+    return ref or f"#{doc.get('document_id')}"
+
+
+def notify_sale(cfg: Config, doc: dict, salesman: str | None, daily_total: float) -> None:
+    total = fmt_eur(doc.get("gross_value"))
+    vendedor = (salesman or "").strip() or "—"
+    message = (
+        f"Total: {total}\n"
+        f"Vendedor: {vendedor}\n"
+        f"Total do dia: {fmt_eur(daily_total)}"
+    )
+    send_ntfy(
+        cfg,
+        title="\U0001f4b8 Nova Venda \U0001f4b8",
+        message=message,
+        tags=["money_with_wings"],
+        priority=cfg.ntfy_priority,
+    )
+    LOG.info(
+        "Notificada venda %s (vendedor=%s, total=%s, dia=%s).",
+        doc_reference(doc),
+        vendedor,
+        total,
+        fmt_eur(daily_total),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Polling
+# --------------------------------------------------------------------------- #
+def matches_filters(cfg: Config, doc: dict) -> bool:
+    if cfg.document_type_id and int(doc.get("document_type_id", 0)) != cfg.document_type_id:
+        return False
+    return True
+
+
+def daily_total_for(docs: list, doc: dict) -> float:
+    """Sum of gross_value for same-day sales up to and including this document."""
+    day = str(doc.get("date", ""))[:10]
+    did = int(doc.get("document_id", 0))
+    return sum(
+        float(d.get("gross_value") or 0)
+        for d in docs
+        if str(d.get("date", ""))[:10] == day and int(d.get("document_id", 0)) <= did
+    )
+
+
+def poll_once(cfg: Config, state: State) -> int:
+    moloni = Moloni(cfg, state)
+
+    def work():
+        cid = moloni.company_id()
+        return cid, moloni.recent_documents(cid)
+
+    try:
+        company_id, docs = work()
+    except AuthError as exc:
+        LOG.warning("Erro de autenticacao (%s); a renovar credenciais.", exc)
+        moloni.reauthenticate()
+        company_id, docs = work()
+
+    docs = [d for d in docs if matches_filters(cfg, d)]
+
+    if state.last_seen_document_id == 0:
+        # First start: set the baseline so we don't replay every existing sale.
+        if docs:
+            state.last_seen_document_id = max(int(d.get("document_id", 0)) for d in docs)
+        state.save()
+        LOG.info(
+            "Primeiro arranque: marcado documento #%s. So notifico vendas a partir de agora.",
+            state.last_seen_document_id,
+        )
+        return 0
+
+    new_docs = sorted(
+        (d for d in docs if int(d.get("document_id", 0)) > state.last_seen_document_id),
+        key=lambda d: int(d.get("document_id", 0)),
+    )
+    for doc in new_docs:
+        salesman = moloni.salesman_name(company_id, doc.get("salesman_id"))
+        notify_sale(cfg, doc, salesman, daily_total_for(docs, doc))
+        state.last_seen_document_id = max(
+            state.last_seen_document_id, int(doc.get("document_id", 0))
+        )
+
+    state.save()
+    if new_docs:
+        LOG.info("%d nova(s) venda(s) notificada(s).", len(new_docs))
+    else:
+        LOG.debug("Sem vendas novas.")
+    return len(new_docs)
+
+
+# --------------------------------------------------------------------------- #
+# Daemon
+# --------------------------------------------------------------------------- #
+_STOP = False
+
+
+def _handle_signal(signum, _frame):
+    global _STOP
+    _STOP = True
+    LOG.info("Sinal %s recebido; a terminar...", signum)
+
+
+def run_forever(cfg: Config) -> None:
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+    LOG.info(
+        "Monitorizacao iniciada (intervalo=%ss, ntfy=%s, topico=%s).",
+        cfg.poll_interval,
+        cfg.ntfy_server,
+        cfg.ntfy_topic,
+    )
+    state = State.load(cfg.state_file)
+    while not _STOP:
+        try:
+            poll_once(cfg, state)
+        except Exception as exc:  # keep the daemon alive on transient errors
+            LOG.exception("Erro no ciclo de polling: %s", exc)
+        for _ in range(cfg.poll_interval):  # responsive sleep for fast shutdown
+            if _STOP:
+                break
+            time.sleep(1)
+    LOG.info("Monitorizacao terminada.")
+
+
+# --------------------------------------------------------------------------- #
+# One-shot commands
+# --------------------------------------------------------------------------- #
+def cmd_check(cfg: Config) -> None:
+    cfg.require_moloni()
+    state = State.load(cfg.state_file)
+    moloni = Moloni(cfg, state)
+    moloni.access_token()
+    cid = moloni.company_id()
+    docs = moloni.recent_documents(cid)
+    print(
+        f"OK: autenticado, company_id={cid}, {len(docs)} documento(s) na janela de "
+        f"{cfg.lookback_days + 1} dia(s)."
+    )
+    print(
+        f"Filtros -> document_set_id={cfg.document_set_id}, "
+        f"document_type_id={cfg.document_type_id}, status={cfg.status}"
+    )
+    print(
+        f"ntfy -> servidor={cfg.ntfy_server}, "
+        f"topico={'(definido)' if cfg.ntfy_topic else '(EM FALTA)'}"
+    )
+
+
+def cmd_list_types(cfg: Config) -> None:
+    cfg.require_moloni()
+    state = State.load(cfg.state_file)
+    moloni = Moloni(cfg, state)
+    cid = moloni.company_id()
+
+    print("\n=== Tipos de documento (MOLONI_DOCUMENT_TYPE_ID) ===")
+    for t in moloni.document_types(cid):
+        print(
+            f"  id={str(t.get('document_type_id')):>4}  {t.get('name')}  "
+            f"(saft={t.get('saft_code')})"
+        )
+
+    print("\n=== Series / conjuntos (MOLONI_DOCUMENT_SET_ID) ===")
+    for s in moloni.document_sets(cid):
+        print(f"  id={str(s.get('document_set_id')):>4}  {s.get('name')}")
+
+    print("\n=== Ultimos documentos (para identificares a 'venda em loja') ===")
+    docs = sorted(
+        moloni.recent_documents(cid),
+        key=lambda d: int(d.get("document_id", 0)),
+        reverse=True,
+    )[:15]
+    for d in docs:
+        print(
+            f"  doc_id={d.get('document_id')}  tipo={d.get('document_type_id')}  "
+            f"serie={(d.get('document_set') or {}).get('name')}  "
+            f"status={d.get('status')}  {d.get('date')}  "
+            f"{d.get('entity_name')}  {fmt_eur(d.get('gross_value'))}"
+        )
+    print(
+        "\nDica: define MOLONI_DOCUMENT_TYPE_ID e/ou MOLONI_DOCUMENT_SET_ID e "
+        "MOLONI_STATUS com base nas linhas acima."
+    )
+
+
+def cmd_test_notify(cfg: Config) -> None:
+    cfg.require_ntfy()
+    send_ntfy(
+        cfg,
+        title="✅ Teste Moloni -> ntfy",
+        message="Se recebeste isto, as notificacoes estao a funcionar.",
+        tags=["white_check_mark"],
+        priority=cfg.ntfy_priority,
+    )
+    print(f"Notificacao de teste enviada para {cfg.ntfy_server} (topico {cfg.ntfy_topic}).")
+
+
+# --------------------------------------------------------------------------- #
+# Entry point
+# --------------------------------------------------------------------------- #
+def main(argv=None) -> int:
+    _load_env_file()
+    cfg = Config()
+    logging.basicConfig(
+        level=getattr(logging, cfg.log_level, logging.INFO),
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+
+    parser = argparse.ArgumentParser(description="Notifica vendas do Moloni via ntfy.")
+    sub = parser.add_subparsers(dest="command", required=True)
+    for name, help_text in [
+        ("run", "Corre em continuo (cloud/daemon)."),
+        ("once", "Faz um ciclo e sai (cron/serverless)."),
+        ("check", "Valida configuracao e ligacao ao Moloni."),
+        ("list-types", "Mostra tipos/series/documentos para configurar os filtros."),
+        ("test-notify", "Envia uma notificacao de teste pelo ntfy."),
+    ]:
+        sub.add_parser(name, help=help_text)
+
+    args = parser.parse_args(argv)
+
+    if args.command == "run":
+        cfg.require_moloni()
+        cfg.require_ntfy()
+        run_forever(cfg)
+    elif args.command == "once":
+        cfg.require_moloni()
+        cfg.require_ntfy()
+        poll_once(cfg, State.load(cfg.state_file))
+    elif args.command == "check":
+        cmd_check(cfg)
+    elif args.command == "list-types":
+        cmd_list_types(cfg)
+    elif args.command == "test-notify":
+        cmd_test_notify(cfg)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

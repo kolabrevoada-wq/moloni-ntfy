@@ -1,0 +1,10 @@
+services:
+  moloni-ntfy:
+    build: .
+    container_name: moloni-ntfy
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      STATE_FILE: /data/state.json
+    volumes:
+      - ./data:/data

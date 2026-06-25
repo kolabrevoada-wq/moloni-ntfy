@@ -1,0 +1,57 @@
+name: Moloni -> ntfy
+
+on:
+  schedule:
+    # A cada 5 minutos (mínimo do GitHub; pode atrasar sob carga).
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}   # permite correr manualmente a partir da aba Actions
+
+# Evita execuções sobrepostas (cada run termina em segundos).
+concurrency:
+  group: moloni-ntfy
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependências
+        run: pip install requests python-dotenv
+
+      # Restaura o estado (last_seen_document_id + tokens) da execução anterior.
+      - name: Restaurar estado
+        uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: moloni-state-${{ github.run_id }}
+          restore-keys: |
+            moloni-state-
+
+      - name: Verificar vendas e notificar
+        env:
+          MOLONI_CLIENT_ID: ${{ secrets.MOLONI_CLIENT_ID }}
+          MOLONI_CLIENT_SECRET: ${{ secrets.MOLONI_CLIENT_SECRET }}
+          MOLONI_USERNAME: ${{ secrets.MOLONI_USERNAME }}
+          MOLONI_PASSWORD: ${{ secrets.MOLONI_PASSWORD }}
+          MOLONI_COMPANY_ID: ${{ secrets.MOLONI_COMPANY_ID }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_SERVER: ${{ vars.NTFY_SERVER || 'https://ntfy.sh' }}
+          NTFY_PRIORITY: high
+          MOLONI_STATUS: "1"
+          STATE_FILE: data/state.json
+        run: python moloni_ntfy.py once
+
+      # Guarda o estado atualizado para a próxima execução.
+      - name: Guardar estado
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: moloni-state-${{ github.run_id }}
