@@ -161,6 +161,9 @@ journalctl -u moloni-ntfy -f
 | `STATE_FILE` | `./data/state.json` | Onde guarda o estado |
 | `ACTIVE_START` / `ACTIVE_END` | (vazio) | Janela ativa local `"HH:MM"` (vazio = 24h) |
 | `ACTIVE_TZ` | `Europe/Lisbon` | Fuso horário da janela ativa (trata do verão/inverno) |
+| `SUMMARY_TIME` | `20:30` | Hora do resumo diário (vazio = desligado) |
+| `DAILY_GOAL` | `4200` | Objetivo do dia em € (emoji ✅/❌ no resumo) |
+| `SUMMARY_SALESMEN` | `Reshma,Pajo,Rodrigo,Izadora` | Vendedores listados no resumo (resto = "Outros") |
 
 ## Resolução de problemas
 

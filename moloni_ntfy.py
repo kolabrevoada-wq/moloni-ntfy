@@ -113,6 +113,15 @@ class Config:
         # job ends in time to be relaunched (the GitHub Actions "chain").
         self.max_runtime = int(os.getenv("MAX_RUNTIME_SECONDS", "0"))
 
+        # Daily summary at SUMMARY_TIME (local, cfg.active_tz); empty disables it.
+        self.summary_time = os.getenv("SUMMARY_TIME", "20:30").strip()
+        self.daily_goal = float(os.getenv("DAILY_GOAL", "4200"))
+        self.summary_salesmen = [
+            s.strip()
+            for s in os.getenv("SUMMARY_SALESMEN", "Reshma,Pajo,Rodrigo,Izadora").split(",")
+            if s.strip()
+        ]
+
     def require_moloni(self) -> None:
         missing = [
             name
@@ -146,6 +155,7 @@ class State:
         self.refresh_token = None
         self.refresh_token_expires_at = 0.0
         self.last_seen_document_id = 0
+        self.last_summary_date = None  # "YYYY-MM-DD" of the last daily summary sent
 
     @classmethod
     def load(cls, path: str) -> "State":
@@ -160,6 +170,7 @@ class State:
                 state.refresh_token = data.get("refresh_token")
                 state.refresh_token_expires_at = data.get("refresh_token_expires_at", 0.0)
                 state.last_seen_document_id = data.get("last_seen_document_id", 0)
+                state.last_summary_date = data.get("last_summary_date")
             except Exception as exc:
                 LOG.warning("Nao consegui ler o estado (%s): %s", path, exc)
         return state
@@ -176,6 +187,7 @@ class State:
                     "refresh_token": self.refresh_token,
                     "refresh_token_expires_at": self.refresh_token_expires_at,
                     "last_seen_document_id": self.last_seen_document_id,
+                    "last_summary_date": self.last_summary_date,
                 },
                 fh,
                 indent=2,
@@ -288,30 +300,44 @@ class Moloni:
         LOG.info("A usar company_id=%s (define MOLONI_COMPANY_ID para fixar).", cid)
         return cid
 
+    def documents_on_date(self, company_id: int, day_iso: str) -> list:
+        docs: list = []
+        offset = 0
+        while True:
+            params = {
+                "company_id": company_id,
+                "date": day_iso,
+                "qty": 50,
+                "offset": offset,
+            }
+            if self.cfg.document_set_id:
+                params["document_set_id"] = self.cfg.document_set_id
+            if self.cfg.status is not None:
+                params["status"] = self.cfg.status
+            page = self.call("documents/getAll", params)
+            if not isinstance(page, list) or not page:
+                break
+            docs.extend(page)
+            if len(page) < 50:
+                break
+            offset += 50
+        return docs
+
     def recent_documents(self, company_id: int) -> list:
         docs: list = []
         today = date.today()
         for delta in range(self.cfg.lookback_days + 1):
             day = (today - timedelta(days=delta)).isoformat()
-            offset = 0
-            while True:
-                params = {
-                    "company_id": company_id,
-                    "date": day,
-                    "qty": 50,
-                    "offset": offset,
-                }
-                if self.cfg.document_set_id:
-                    params["document_set_id"] = self.cfg.document_set_id
-                if self.cfg.status is not None:
-                    params["status"] = self.cfg.status
-                page = self.call("documents/getAll", params)
-                if not isinstance(page, list) or not page:
-                    break
-                docs.extend(page)
-                if len(page) < 50:
-                    break
-                offset += 50
+            docs.extend(self.documents_on_date(company_id, day))
+        return docs
+
+    def documents_between(self, company_id: int, start, end) -> list:
+        """All documents with date in [start, end] (inclusive), start/end = date objects."""
+        docs: list = []
+        day = start
+        while day <= end:
+            docs.extend(self.documents_on_date(company_id, day.isoformat()))
+            day += timedelta(days=1)
         return docs
 
     def document_types(self, company_id: int) -> list:
@@ -465,7 +491,93 @@ def within_active_window(cfg: Config, now: "datetime | None" = None) -> bool:
     return now_min >= start or now_min <= end  # overnight window
 
 
+def _sum_net(docs) -> float:
+    return sum(float(d.get("net_value") or 0) for d in docs)
+
+
+def maybe_send_daily_summary(cfg: Config, state: State, moloni: "Moloni") -> None:
+    """Once per day, at/after SUMMARY_TIME, send per-salesman + accumulated totals."""
+    if not cfg.summary_time:
+        return
+    now = _local_now(cfg)
+    summary_min = _hhmm_to_minutes(cfg.summary_time)
+    now_min = now.hour * 60 + now.minute
+    if now_min < summary_min or now_min > summary_min + 180:
+        return  # not yet, or too late (missed window)
+    today = now.date()
+    if state.last_summary_date == today.isoformat():
+        return  # already sent today
+
+    cid = moloni.company_id()
+    month_start = today.replace(day=1)
+    week_start = today - timedelta(days=today.weekday())  # Monday
+    month_docs = moloni.documents_between(cid, month_start, today)
+
+    def day_of(doc):
+        return str(doc.get("date", ""))[:10]
+
+    day_iso, week_iso = today.isoformat(), week_start.isoformat()
+    day_docs = [d for d in month_docs if day_of(d) == day_iso]
+    day_total = _sum_net(day_docs)
+    week_total = _sum_net(d for d in month_docs if day_of(d) >= week_iso)
+    month_total = _sum_net(month_docs)
+
+    # Per-salesman totals for today.
+    named = {n.casefold(): n for n in cfg.summary_salesmen}
+    totals = {n: 0.0 for n in cfg.summary_salesmen}
+    outros = 0.0
+    for d in day_docs:
+        name = (moloni.salesman_name(cid, d.get("salesman_id")) or "").strip()
+        value = float(d.get("net_value") or 0)
+        if name.casefold() in named:
+            totals[named[name.casefold()]] += value
+        else:
+            outros += value
+
+    lines = [f"{n}: {fmt_eur(totals[n])}" for n in cfg.summary_salesmen]
+    lines += ["Outros: " + fmt_eur(outros), "", "Total do dia: " + fmt_eur(day_total)]
+    send_ntfy(
+        cfg,
+        title="\U0001f4ca Totais do dia",
+        message="\n".join(lines),
+        tags=["bar_chart"],
+        priority=cfg.ntfy_priority,
+    )
+
+    emoji = "✅" if day_total > cfg.daily_goal else "❌"
+    msg2 = (
+        f"Semana: {fmt_eur(week_total)}\n"
+        f"Mês: {fmt_eur(month_total)}\n"
+        f"Objetivo do dia: {emoji}  ({fmt_eur(day_total)} / {fmt_eur(cfg.daily_goal)})"
+    )
+    send_ntfy(
+        cfg,
+        title="\U0001f4c8 Acumulado",
+        message=msg2,
+        tags=["chart_with_upwards_trend"],
+        priority=cfg.ntfy_priority,
+    )
+
+    state.last_summary_date = today.isoformat()
+    state.save()
+    LOG.info("Resumo diario enviado (dia=%s, total=%s).", day_iso, fmt_eur(day_total))
+
+
 def poll_once(cfg: Config, state: State) -> int:
+    moloni = Moloni(cfg, state)
+
+    try:
+        maybe_send_daily_summary(cfg, state, moloni)
+    except AuthError as exc:
+        LOG.warning("Auth no resumo diario (%s); a renovar.", exc)
+        try:
+            moloni.reauthenticate()
+            maybe_send_daily_summary(cfg, state, moloni)
+        except Exception:
+            LOG.exception("Falha no resumo diario (pos-reauth).")
+    except Exception:
+        LOG.exception("Falha no resumo diario.")
+
     if not within_active_window(cfg):
         LOG.info(
             "Fora do horário ativo (%s-%s %s); ciclo ignorado.",
@@ -474,7 +586,6 @@ def poll_once(cfg: Config, state: State) -> int:
             cfg.active_tz,
         )
         return 0
-    moloni = Moloni(cfg, state)
 
     def work():
         cid = moloni.company_id()
