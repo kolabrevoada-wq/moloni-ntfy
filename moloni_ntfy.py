@@ -123,6 +123,12 @@ class Config:
         ]
         # Product category whose items are excluded from the piece count (bags).
         self.bag_category = os.getenv("BAG_CATEGORY", "Sacos").strip()
+        # Categories hidden from "Marcas vendidas"/top brand (pieces still count).
+        self.exclude_brands = [
+            s.strip()
+            for s in os.getenv("EXCLUDE_BRANDS", "Apparel,Home Goods,Carreira").split(",")
+            if s.strip()
+        ]
 
     def require_moloni(self) -> None:
         missing = [
@@ -560,10 +566,11 @@ def _sum_net(docs) -> float:
     return sum(float(d.get("net_value") or 0) for d in docs)
 
 
-def sales_resume(moloni: "Moloni", company_id: int, docs: list) -> dict:
+def sales_resume(moloni: "Moloni", company_id: int, docs: list, exclude_brands=()) -> dict:
     """Compute the 'Resumo de vendas' metrics over docs (bags excluded from pieces)."""
     catmap = moloni.category_map(company_id)
     bag_ids = moloni.bag_category_ids(company_id)
+    excluded = {b.strip().casefold() for b in exclude_brands}
     pieces_by_brand: dict = {}
     total_pieces = 0.0
     for d in docs:
@@ -571,11 +578,13 @@ def sales_resume(moloni: "Moloni", company_id: int, docs: list) -> dict:
             cat_id = p.get("category_id")
             cat_id = int(cat_id) if cat_id is not None else None
             if cat_id in bag_ids:
-                continue  # exclude bags
+                continue  # bags excluded from everything
             qty = float(p.get("qty") or 0)
+            total_pieces += qty  # every non-bag piece counts
             name = (catmap.get(cat_id, {}).get("name") if cat_id is not None else None) or "Sem categoria"
+            if name.casefold() in excluded:
+                continue  # hidden from the brand list / top brand (still counted above)
             pieces_by_brand[name] = pieces_by_brand.get(name, 0.0) + qty
-            total_pieces += qty
     n_docs = len(docs)
     top_brand = max(pieces_by_brand, key=pieces_by_brand.get) if pieces_by_brand else "—"
     return {
@@ -666,7 +675,7 @@ def maybe_send_daily_summary(cfg: Config, state: State, moloni: "Moloni") -> Non
     send_ntfy(
         cfg,
         title="\U0001f9fe Resumo de vendas — dia",
-        message=format_resume(sales_resume(moloni, cid, day_docs), "do dia"),
+        message=format_resume(sales_resume(moloni, cid, day_docs, cfg.exclude_brands), "do dia"),
         tags=["receipt"],
         priority=cfg.ntfy_priority,
     )
@@ -677,7 +686,7 @@ def maybe_send_daily_summary(cfg: Config, state: State, moloni: "Moloni") -> Non
         send_ntfy(
             cfg,
             title="\U0001f9fe Resumo de vendas — semana",
-            message=format_resume(sales_resume(moloni, cid, week_docs), "da semana"),
+            message=format_resume(sales_resume(moloni, cid, week_docs, cfg.exclude_brands), "da semana"),
             tags=["receipt"],
             priority=cfg.ntfy_priority,
         )

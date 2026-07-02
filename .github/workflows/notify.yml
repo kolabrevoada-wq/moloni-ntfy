@@ -62,6 +62,7 @@ jobs:
           DAILY_GOAL: "4200"
           SUMMARY_SALESMEN: "Reshma,Pajo,Rodrigo,Izadora"
           BAG_CATEGORY: "Sacos"
+          EXCLUDE_BRANDS: "Apparel,Home Goods,Carreira"
           POLL_INTERVAL_SECONDS: "120"
           # ~5,5h por job (limite do GitHub é 6h); depois relança o seguinte.
           MAX_RUNTIME_SECONDS: ${{ github.event.inputs.max_runtime || '19800' }}
