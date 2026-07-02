@@ -164,6 +164,7 @@ journalctl -u moloni-ntfy -f
 | `SUMMARY_TIME` | `20:30` | Hora do resumo diário (vazio = desligado) |
 | `DAILY_GOAL` | `4200` | Objetivo do dia em € (emoji ✅/❌ no resumo) |
 | `SUMMARY_SALESMEN` | `Reshma,Pajo,Rodrigo,Izadora` | Vendedores listados no resumo (resto = "Outros") |
+| `BAG_CATEGORY` | `Sacos` | Categoria de sacos, excluída da contagem de peças |
 
 ## Resolução de problemas
 

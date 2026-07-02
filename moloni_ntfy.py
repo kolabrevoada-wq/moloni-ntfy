@@ -121,6 +121,8 @@ class Config:
             for s in os.getenv("SUMMARY_SALESMEN", "Reshma,Pajo,Rodrigo,Izadora").split(",")
             if s.strip()
         ]
+        # Product category whose items are excluded from the piece count (bags).
+        self.bag_category = os.getenv("BAG_CATEGORY", "Sacos").strip()
 
     def require_moloni(self) -> None:
         missing = [
@@ -204,6 +206,8 @@ class Moloni:
         self.state = state
         self.session = requests.Session()
         self._salesmen = None  # lazy cache: salesman_id -> name
+        self._categories = None  # lazy cache: category_id -> {name, parent_id}
+        self._products_cache = {}  # document_id -> product lines (getOne)
 
     # --- authentication ---------------------------------------------------- #
     def access_token(self) -> str:
@@ -380,6 +384,67 @@ class Moloni:
                 continue
         self._salesmen = mapping
 
+    def category_map(self, company_id: int) -> dict:
+        """Full category_id -> {name, parent_id}, recursing the category tree."""
+        if self._categories is not None:
+            return self._categories
+        result: dict = {}
+        queue = [0]
+        seen = set()
+        while queue:
+            parent = queue.pop()
+            if parent in seen:
+                continue
+            seen.add(parent)
+            try:
+                cats = self.call(
+                    "productCategories/getAll",
+                    {"company_id": company_id, "parent_id": parent},
+                )
+            except MoloniError:
+                cats = []
+            if not isinstance(cats, list):
+                continue
+            for c in cats:
+                try:
+                    cat_id = int(c["category_id"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                result[cat_id] = {
+                    "name": c.get("name"),
+                    "parent_id": int(c.get("parent_id") or 0),
+                }
+                queue.append(cat_id)
+        self._categories = result
+        return result
+
+    def bag_category_ids(self, company_id: int) -> set:
+        """Ids of the bag category (matched by name) plus all its descendants."""
+        catmap = self.category_map(company_id)
+        target = self.cfg.bag_category.casefold()
+        ids = {
+            cid
+            for cid, info in catmap.items()
+            if (info.get("name") or "").strip().casefold() == target
+        }
+        changed = True
+        while changed:
+            changed = False
+            for cid, info in catmap.items():
+                if cid not in ids and info.get("parent_id") in ids:
+                    ids.add(cid)
+                    changed = True
+        return ids
+
+    def document_products(self, company_id: int, document_id) -> list:
+        key = int(document_id)
+        if key in self._products_cache:
+            return self._products_cache[key]
+        full = self.call("documents/getOne", {"company_id": company_id, "document_id": key})
+        products = full.get("products") or [] if isinstance(full, dict) else []
+        self._products_cache[key] = products
+        return products
+
 
 # --------------------------------------------------------------------------- #
 # ntfy notifications
@@ -495,6 +560,45 @@ def _sum_net(docs) -> float:
     return sum(float(d.get("net_value") or 0) for d in docs)
 
 
+def sales_resume(moloni: "Moloni", company_id: int, docs: list) -> dict:
+    """Compute the 'Resumo de vendas' metrics over docs (bags excluded from pieces)."""
+    catmap = moloni.category_map(company_id)
+    bag_ids = moloni.bag_category_ids(company_id)
+    pieces_by_brand: dict = {}
+    total_pieces = 0.0
+    for d in docs:
+        for p in moloni.document_products(company_id, d.get("document_id")):
+            cat_id = p.get("category_id")
+            cat_id = int(cat_id) if cat_id is not None else None
+            if cat_id in bag_ids:
+                continue  # exclude bags
+            qty = float(p.get("qty") or 0)
+            name = (catmap.get(cat_id, {}).get("name") if cat_id is not None else None) or "Sem categoria"
+            pieces_by_brand[name] = pieces_by_brand.get(name, 0.0) + qty
+            total_pieces += qty
+    n_docs = len(docs)
+    top_brand = max(pieces_by_brand, key=pieces_by_brand.get) if pieces_by_brand else "—"
+    return {
+        "brands": sorted(pieces_by_brand.keys()),
+        "top_brand": top_brand,
+        "pieces": total_pieces,
+        "docs": n_docs,
+        "avg": (total_pieces / n_docs) if n_docs else 0.0,
+    }
+
+
+def format_resume(metrics: dict, period_label: str) -> str:
+    brands = ", ".join(metrics["brands"]) if metrics["brands"] else "—"
+    avg = f"{metrics['avg']:.1f}".replace(".", ",")
+    return (
+        f"Marcas vendidas: {brands}\n"
+        f"Marca mais vendida: {metrics['top_brand']}\n"
+        f"Número de peças vendidas: {int(round(metrics['pieces']))}\n"
+        f"Número de talões: {metrics['docs']}\n"
+        f"Número de peças média por talão {period_label}: {avg}"
+    )
+
+
 def maybe_send_daily_summary(cfg: Config, state: State, moloni: "Moloni") -> None:
     """Once per day, at/after SUMMARY_TIME, send per-salesman + accumulated totals."""
     if not cfg.summary_time:
@@ -557,6 +661,26 @@ def maybe_send_daily_summary(cfg: Config, state: State, moloni: "Moloni") -> Non
         tags=["chart_with_upwards_trend"],
         priority=cfg.ntfy_priority,
     )
+
+    # Resumo de vendas (diário — todos os dias).
+    send_ntfy(
+        cfg,
+        title="\U0001f9fe Resumo de vendas — dia",
+        message=format_resume(sales_resume(moloni, cid, day_docs), "do dia"),
+        tags=["receipt"],
+        priority=cfg.ntfy_priority,
+    )
+
+    # Resumo de vendas (semanal — aos domingos).
+    if today.weekday() == 6:  # segunda=0 ... domingo=6
+        week_docs = [d for d in month_docs if day_of(d) >= week_iso]
+        send_ntfy(
+            cfg,
+            title="\U0001f9fe Resumo de vendas — semana",
+            message=format_resume(sales_resume(moloni, cid, week_docs), "da semana"),
+            tags=["receipt"],
+            priority=cfg.ntfy_priority,
+        )
 
     state.last_summary_date = today.isoformat()
     state.save()
