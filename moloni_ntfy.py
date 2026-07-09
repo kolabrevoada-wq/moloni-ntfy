@@ -483,25 +483,49 @@ def fmt_eur(value) -> str:
     return formatted.replace(",", " ").replace(".", ",") + " €"
 
 
+def line_value_with_iva(product: dict) -> float:
+    """Line total WITH tax = qty * unit price * (1 - discount) * (1 + tax rate)."""
+    qty = float(product.get("qty") or 0)
+    price = float(product.get("price") or 0)  # unit price, tax excluded
+    discount = float(product.get("discount") or 0)
+    base = qty * price * (1 - discount / 100)
+    rate = sum(float(t.get("value") or 0) for t in (product.get("taxes") or []))
+    return base * (1 + rate / 100)
+
+
 def doc_reference(doc: dict) -> str:
     set_name = (doc.get("document_set") or {}).get("name") or ""
     ref = f"{set_name} {doc.get('number')}".strip()
     return ref or f"#{doc.get('document_id')}"
 
 
-def notify_sale(cfg: Config, doc: dict, salesman: str | None, daily_total: float) -> None:
+def notify_sale(
+    cfg: Config, doc: dict, salesman: str | None, daily_total: float, products=None
+) -> None:
     # Moloni: net_value = total COM IVA; gross_value = base sem IVA.
     total = fmt_eur(doc.get("net_value"))
     vendedor = (salesman or "").strip() or "—"
-    message = (
-        f"Total: {total}\n"
-        f"Vendedor: {vendedor}\n"
-        f"Total do dia: {fmt_eur(daily_total)}"
-    )
+    lines = [
+        f"Total: {total}",
+        f"Vendedor: {vendedor}",
+        f"Total do dia: {fmt_eur(daily_total)}",
+    ]
+    if products:
+        lines.append("")
+        lines.append("Peças:")
+        for p in products:
+            name = (p.get("name") or "Artigo").strip()
+            qty = float(p.get("qty") or 0)
+            value = fmt_eur(line_value_with_iva(p))
+            if qty and qty != 1:
+                q = int(qty) if qty == int(qty) else round(qty, 2)
+                lines.append(f"• {q}× {name}: {value}")
+            else:
+                lines.append(f"• {name}: {value}")
     send_ntfy(
         cfg,
         title="\U0001f4b8 Nova Venda \U0001f4b8",
-        message=message,
+        message="\n".join(lines),
         tags=["money_with_wings"],
         priority=cfg.ntfy_priority,
     )
@@ -750,7 +774,8 @@ def poll_once(cfg: Config, state: State) -> int:
     )
     for doc in new_docs:
         salesman = moloni.salesman_name(company_id, doc.get("salesman_id"))
-        notify_sale(cfg, doc, salesman, daily_total_for(docs, doc))
+        products = moloni.document_products(company_id, doc.get("document_id"))
+        notify_sale(cfg, doc, salesman, daily_total_for(docs, doc), products)
         state.last_seen_document_id = max(
             state.last_seen_document_id, int(doc.get("document_id", 0))
         )
