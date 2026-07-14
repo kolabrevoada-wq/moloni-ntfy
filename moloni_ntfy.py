@@ -505,9 +505,11 @@ def notify_sale(
     # Moloni: net_value = total COM IVA; gross_value = base sem IVA.
     total = fmt_eur(doc.get("net_value"))
     vendedor = (salesman or "").strip() or "—"
+    cliente = (doc.get("entity_name") or "").strip() or "Consumidor final"
     lines = [
         f"Total: {total}",
         f"Vendedor: {vendedor}",
+        f"Cliente: {cliente}",
         f"Total do dia: {fmt_eur(daily_total)}",
     ]
     if products:
